@@ -8,7 +8,7 @@
 #
 set -uo pipefail
 
-PZCTL_VERSION="2.1.1"
+PZCTL_VERSION="2.2.0"
 
 # ------------------------------------------------------------ config (from installer)
 ENVF="${PZCTL_ENV:-/etc/zomboid-b42.env}"; [ -f "$ENVF" ] && . "$ENVF"
@@ -71,6 +71,7 @@ do_status() {
     "console log"   "$PZ_CONSOLE" \
     "backups"       "$PZ_BACKUPS" \
     "mod updates"   "$PZ_UPDATELOG" \
+    "downloader"    "$PZ_DDLOG" \
     "env file"      "$ENVF"
   echo; echo "$(bold 'Last console lines:')"
   tail -n 6 "$PZ_CONSOLE" 2>/dev/null | sed 's/^/  /'
@@ -79,7 +80,10 @@ do_status() {
 
 do_logs() {
   echo "Live server log — $(ylw 'Ctrl+C to return to the menu')."; sleep 1
+  # without the trap, Ctrl+C reaches pzctl too and quits the whole panel
+  trap 'echo' INT
   tail -n 40 -f "$PZ_CONSOLE" 2>/dev/null || echo "No console log yet."
+  trap - INT
   echo; pause
 }
 
@@ -93,13 +97,25 @@ active_mods() {
   fi
 }
 disabled_mods() { DISABLED=(); [ -f "$PZ_DISABLED" ] && mapfile -t DISABLED < <(grep . "$PZ_DISABLED" || true); }
+# mods sitting in the mods folder that are in neither list: manually copied in,
+# or left behind by a removal. They do nothing until they are enabled.
+orphan_mods() {
+  ORPHAN=(); local m known=";$(mods_get);"
+  [ -f "$PZ_DISABLED" ] && known="$known$(tr '\n' ';' < "$PZ_DISABLED");"
+  while IFS= read -r m; do
+    [ -z "$m" ] && continue
+    case "$known" in *";$m;"*) : ;; *) ORPHAN+=("$m") ;; esac
+  done < <(disk_mod_ids)
+}
 
-print_mod_list() {   # sets ACTIVE/DISABLED, prints both numbered continuously
-  active_mods; disabled_mods
+print_mod_list() {   # sets ACTIVE/DISABLED/ORPHAN, numbered continuously
+  active_mods; disabled_mods; orphan_mods
   local i=1 m
-  if [ ${#ACTIVE[@]} -eq 0 ] && [ ${#DISABLED[@]} -eq 0 ]; then echo "  (no mods)"; return; fi
+  if [ ${#ACTIVE[@]} -eq 0 ] && [ ${#DISABLED[@]} -eq 0 ] && [ ${#ORPHAN[@]} -eq 0 ]; then echo "  (no mods)"; return; fi
   for m in "${ACTIVE[@]}"; do printf '  %2d) %s\n' "$i" "$m"; i=$((i+1)); done
   for m in "${DISABLED[@]}"; do printf '  %2d) %s %s\n' "$i" "$(ylw '[off]')" "$m"; i=$((i+1)); done
+  for m in "${ORPHAN[@]}"; do printf '  %2d) %s %s\n' "$i" "$(ylw '[on disk, not in the list]')" "$m"; i=$((i+1)); done
+  [ ${#ORPHAN[@]} -gt 0 ] && echo "      ${#ORPHAN[@]} mod(s) are installed but not loaded — use $(bold 'Disable / enable') to switch them on."
 }
 
 # expand "2 5 7-9" into validated ascending unique indices (1..$2)
@@ -126,9 +142,17 @@ do_add_mod() {
   echo "  single mod:  ...filedetails/?id=3713362869"
   echo "  collection:  ...filedetails/?id=2903157839   (installs every mod in it)"
   local raw id; local -a ids=()
+  if ! dd_ready; then
+    red "DepotDownloader isn't usable, so no mod can be downloaded."
+    echo "  configured as: ${PZ_DD:-<empty>}"
+    echo "  fix: re-run $(bold 'sudo ./install.sh') from the repo (it reinstalls the downloader)."
+    echo; pause; return
+  fi
   read -rp '  Workshop URL or ID: ' raw || return
   id="$(extract_ws_id "$raw")"
   [ -z "$id" ] && { red "Couldn't find a Workshop ID in that."; echo; pause; return; }
+  # a previous root-run auto-update may have left root-owned mod folders behind
+  ensure_owned "$PZ_MODS" || ylw "Some mod folders belong to another user and sudo isn't available; installs may fail."
   echo "Checking $(bold "$id") (single mod or collection?)..."
   mapfile -t ids < <(resolve_ws_ids "$id")
   local total="${#ids[@]}" coll=no
@@ -139,7 +163,7 @@ do_add_mod() {
   local w t ttl
   while IFS=$'\t' read -r w t ttl; do LIVE[$w]="$t"; TITLE[$w]="$ttl"; done < <(ws_details "${ids[@]}")
   local have; have=";$(disk_mod_ids | tr '\n' ';')"
-  local done_mods=0 fail=0 skipped=0 i=0 wid out n row stored live m allthere
+  local done_mods=0 fail=0 skipped=0 i=0 wid out n row stored live m allthere irc err
   for wid in "${ids[@]}"; do
     i=$((i+1))
     row="$(manifest_row "$wid")"; stored="$(printf '%s' "$row" | cut -f2)"
@@ -158,9 +182,22 @@ do_add_mod() {
       fi
     fi
     [ "$coll" = yes ] && printf '  [%d/%d] %s ... ' "$i" "$total" "$wid"
-    out="$(install_workshop_item "$wid" "${LIVE[$wid]:-}" "${TITLE[$wid]:-}")"
-    if [ -z "$out" ]; then fail=$((fail+1)); [ "$coll" = yes ] && echo "$(red 'failed')"; continue; fi
+    pz_err_clear
+    out="$(install_workshop_item "$wid" "${LIVE[$wid]:-}" "${TITLE[$wid]:-}")"; irc=$?
+    err="$(pz_err_get)"
+    if [ -z "$out" ]; then
+      fail=$((fail+1))
+      # say WHY: a bare "failed" is impossible to act on
+      if [ "$coll" = yes ]; then echo "$(red 'failed') — ${err:-unknown error}"
+      else red "Install failed: ${err:-unknown error}"; echo; fi
+      continue
+    fi
     n="$(printf '%s\n' "$out" | grep -c .)"; done_mods=$((done_mods+n))
+    if [ "$irc" != 0 ]; then
+      fail=$((fail+1))
+      [ "$coll" = yes ] && echo "$(ylw 'partial') ($n) — ${err:-see the log}" || ylw "Partly installed ($n): ${err:-see the log}"
+      continue
+    fi
     if [ "$coll" = yes ]; then echo "$(grn ok) ($n)"; else printf '%s\n' "$out" | sed "s/^/  $(grn +) installed mod: /"; fi
   done
   fix_owner "$PZ_MODS" "$PZ_INI"
@@ -180,13 +217,17 @@ do_add_mod() {
 
 do_remove_mods() {
   print_mod_list
-  local total=$(( ${#ACTIVE[@]} + ${#DISABLED[@]} ))
+  local listed=$(( ${#ACTIVE[@]} + ${#DISABLED[@]} ))
+  local total=$(( listed + ${#ORPHAN[@]} ))
   [ "$total" -eq 0 ] && { pause; return; }
   echo
   local input; read -rp 'Numbers to REMOVE, e.g. "2 5 7-9" (Enter to cancel): ' input || return
   [ -z "$input" ] && return
   local -a picks=(); mapfile -t picks < <(parse_selection "$input" "$total")
   [ ${#picks[@]} -eq 0 ] && { red "No valid numbers in that."; echo; pause; return; }
+  local skipped_orphan=0 p2
+  for p2 in "${picks[@]}"; do [ "$p2" -gt "$listed" ] && skipped_orphan=$((skipped_orphan+1)); done
+  [ "$skipped_orphan" -gt 0 ] && ylw "Skipped $skipped_orphan entry(ies) that are only on disk (nothing to remove from the list)." && echo
   local -a newA=() newD=(); local i=1 m keep p removed=0
   for m in "${ACTIVE[@]}" "${DISABLED[@]}"; do
     keep=1
@@ -254,10 +295,12 @@ do_reorder() {
 
 do_toggle_mods() {
   print_mod_list
-  local nA=${#ACTIVE[@]} total=$(( ${#ACTIVE[@]} + ${#DISABLED[@]} ))
+  local nA=${#ACTIVE[@]} nD=${#DISABLED[@]}
+  local total=$(( nA + nD + ${#ORPHAN[@]} ))
   [ "$total" -eq 0 ] && { pause; return; }
   echo
   echo "Disabled mods stay installed but are taken out of Mods= (players don't need them)."
+  echo "Entries marked $(ylw '[on disk, not in the list]') get switched on the same way."
   local input; read -rp 'Numbers to toggle on/off, e.g. "2 5 7-9" (Enter to cancel): ' input || return
   [ -z "$input" ] && return
   local -a picks=(); mapfile -t picks < <(parse_selection "$input" "$total")
@@ -267,7 +310,8 @@ do_toggle_mods() {
   local -a toDisable=() toEnable=()
   for p in "${picks[@]}"; do
     if [ "$p" -le "$nA" ]; then toDisable+=("${ACTIVE[$((p-1))]}")
-    else toEnable+=("${DISABLED[$((p-nA-1))]}"); fi
+    elif [ "$p" -le $(( nA + nD )) ]; then toEnable+=("${DISABLED[$((p-nA-1))]}")
+    else toEnable+=("${ORPHAN[$((p-nA-nD-1))]}"); fi
   done
   for m in "${toDisable[@]}"; do
     local -a tmp=(); local x
@@ -476,13 +520,83 @@ do_settings() {
   pause
 }
 
-do_backup() {
-  echo "Backing up world + config..."
+do_backup_now() {
+  echo "Backing up world + config (server settings, saves, player database)..."
   local out; out="$(backup_world "$PZ_BACKUPS" pzbackup)"
+  if [ -z "$out" ]; then red "Nothing to back up yet (no world data)."; return 1; fi
   cp "$PZ_JSON" "$PZ_BACKUPS/ProjectZomboid64_$(date +%Y%m%d_%H%M%S).json" 2>/dev/null || true
   fix_owner "$PZ_BACKUPS"
-  echo "$(grn 'Saved') to $out"
-  pause
+  echo "$(grn 'Saved') to $out ($(du -h "$out" 2>/dev/null | cut -f1))"
+}
+
+backups_menu() {
+  local -a BK=()
+  while :; do
+    clear 2>/dev/null || true
+    echo "$(bold '  Backups  —  pzctl')"
+    echo "  ------------------------------------------"
+    mapfile -t BK < <(backup_list)
+    local line f kind i=1
+    if [ ${#BK[@]} -eq 0 ]; then
+      echo "  (no backups yet)"
+    else
+      for line in "${BK[@]}"; do
+        f="${line%%$'\t'*}"; kind="${line##*$'\t'}"
+        printf '  %2d) %s  %7s  %s\n' "$i" \
+          "$(date -r "$f" '+%Y-%m-%d %H:%M' 2>/dev/null || echo '?')" \
+          "$(du -h "$f" 2>/dev/null | cut -f1)" "$kind"
+        i=$((i+1))
+      done
+    fi
+    echo "  ------------------------------------------"
+    echo "  Folder: $PZ_BACKUPS  ($(du -sh "$PZ_BACKUPS" 2>/dev/null | cut -f1 || echo '0') used)"
+    echo "  Each archive holds server settings, saves and the player database."
+    echo
+    echo "   c) Create a backup now       r) Restore a backup"
+    echo "   d) Delete a backup           0) Back"
+    echo
+    local c pick a
+    read -rp '  > ' c || return
+    case "$c" in
+      c|C) echo; do_backup_now; pause ;;
+      r|R)
+        [ ${#BK[@]} -eq 0 ] && { echo "Nothing to restore."; pause; continue; }
+        read -rp '  Number to restore (Enter to cancel): ' pick || continue
+        [ -z "$pick" ] && continue
+        [[ "$pick" =~ ^[0-9]+$ ]] && [ "$pick" -ge 1 ] && [ "$pick" -le ${#BK[@]} ] || { red "Out of range."; echo; pause; continue; }
+        f="${BK[$((pick-1))]%%$'\t'*}"
+        echo
+        echo "$(ylw 'This replaces the current world, server settings and player database')"
+        echo "with the contents of:"
+        echo "  $f"
+        echo "The server will be stopped, and your current world is backed up first."
+        read -rp 'Type RESTORE to proceed: ' a || continue
+        [ "$a" = RESTORE ] || { echo "Cancelled."; pause; continue; }
+        echo "  saving the current world as a pre-restore backup..."
+        backup_world "$PZ_BACKUPS" prerestore >/dev/null
+        echo "  stopping the server..."
+        sudo systemctl stop "$PZ_SERVICE"
+        if backup_restore "$f"; then
+          echo "$(grn 'Restored.')"
+          read -rp 'Start the server now? [Y/n]: ' a || a=Y
+          [[ "$a" =~ ^[Nn] ]] || run_boot_retry
+        else
+          red "Restore failed (unreadable archive?). Your data was left as it was."; echo
+        fi
+        pause ;;
+      d|D)
+        [ ${#BK[@]} -eq 0 ] && { echo "Nothing to delete."; pause; continue; }
+        read -rp '  Number to DELETE (Enter to cancel): ' pick || continue
+        [ -z "$pick" ] && continue
+        [[ "$pick" =~ ^[0-9]+$ ]] && [ "$pick" -ge 1 ] && [ "$pick" -le ${#BK[@]} ] || { red "Out of range."; echo; pause; continue; }
+        f="${BK[$((pick-1))]%%$'\t'*}"
+        read -rp "Delete $(basename "$f")? [y/N]: " a || continue
+        [[ "$a" =~ ^[Yy] ]] && { rm -f "$f" && echo "$(grn Deleted)."; } || echo "Cancelled."
+        pause ;;
+      0|q|Q) return ;;
+      *) : ;;
+    esac
+  done
 }
 
 do_world_reset() {
@@ -601,7 +715,7 @@ while true; do
   echo "  ------------------------------------------"
   echo "   1) Start / bring up        7) Admin console (RCON)"
   echo "   2) Stop                    8) Settings (name/pw/players/RAM)"
-  echo "   3) Restart                 9) Backup world"
+  echo "   3) Restart                 9) Backups (create/restore/delete)"
   echo "   4) Status & paths         10) World reset"
   echo "   5) Live logs              11) Sandbox settings"
   echo "   6) Mods                   12) Mod updates"
@@ -610,7 +724,7 @@ while true; do
   read -rp '  > ' choice || { echo; exit 0; }
   case "$choice" in
     1) do_start ;;   2) do_stop ;;    3) do_restart ;; 4) do_status ;; 5) do_logs ;;
-    6) mods_menu ;;  7) do_console ;; 8) do_settings ;; 9) do_backup ;;
+    6) mods_menu ;;  7) do_console ;; 8) do_settings ;; 9) backups_menu ;;
     10) do_world_reset ;; 11) do_sandbox ;; 12) do_update_settings ;;
     0|q|Q) echo "bye."; exit 0 ;;
     *) : ;;

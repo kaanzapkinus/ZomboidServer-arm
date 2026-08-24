@@ -84,7 +84,7 @@ pzctl
   ------------------------------------------
    1) Start / bring up        7) Admin console (RCON)
    2) Stop                    8) Settings (name/pw/players/RAM)
-   3) Restart                 9) Backup world
+   3) Restart                 9) Backups (create/restore/delete)
    4) Status & paths         10) World reset
    5) Live logs              11) Sandbox settings
    6) Mods                   12) Mod updates
@@ -120,7 +120,8 @@ The Mods menu also does:
 - **Reorder** the load order: type a full order like `3 1 2`, or move one entry with `5>1`.
 - **Disable / enable** mods without uninstalling them. Disabled mods leave `Mods=` (players
   no longer need them) but stay installed for later. Re-adding or updating a collection
-  respects your disable choices.
+  respects your disable choices. Mods you copied into the mods folder by hand show up as
+  `[on disk, not in the list]` and are switched on from the same menu.
 - **Map mods just work**: map folders inside installed mods are detected and added to `Map=`
   automatically, custom maps first and the base map last. Menu → 9 rebuilds the whole line
   from the active mods if it ever drifts.
@@ -177,6 +178,10 @@ restart.
 
 - **Status & paths** (menu 4) shows the game version, branch, mod count, and every directory
   the server uses (install dir, saves, mods, logs, backups).
+- **Backups** (menu 9) lists every archive with its date, size and origin (manual,
+  mod-update, pre-reset), and can create, restore or delete one. A restore stops the server,
+  saves a copy of the current world first, and puts back the settings, saves and player
+  database.
 - **World reset** (menu 10) wipes the map and player data but keeps your settings, sandbox
   options and mods. It offers a backup first and requires typing `RESET`.
 - **Sandbox settings** (menu 11) edits `servertest_SandboxVars.lua` in your terminal editor
@@ -323,6 +328,9 @@ DepotDownloader to keep the install Docker-free and single-binary.
 - **Mod updates never auto-apply**: the scheduler only updates after the server has been empty
   for the configured time, and it needs RCON to count players (menu 12 turns it on). Check the
   update log (menu 12 → 8) and `journalctl -t pz-modupdate`.
+- **A mod fails to install or update**: pzctl prints the downloader's own error, and the full
+  output is kept in `~/Zomboid/depotdownloader.log` (path shown in Status). If it says the
+  downloader is unusable, re-run `sudo ./install.sh` to reinstall it.
 
 ### Credits
 

@@ -100,17 +100,22 @@ do_apply() {
     rotate_backups "$PZ_BACKUPS/mod-update" modup "$keep"
   fi
 
-  local wid stored live title ok=0 fail=0
+  local wid stored live title err ok=0 fail=0
   while IFS=$'\t' read -r wid stored live title; do
     printf '  updating %s (%s) ... ' "$title" "$wid"
+    pz_err_clear
     if install_workshop_item "$wid" >/dev/null; then
       ok=$((ok+1)); echo "ok"
       log_modupdate "updated | $wid | $title | $(fmt_t "$stored") -> $(fmt_t "$live")"
     else
-      fail=$((fail+1)); echo "FAILED (kept previous files)"
-      log_modupdate "FAILED  | $wid | $title | download error, previous version kept"
+      err="$(pz_err_get)"
+      fail=$((fail+1)); echo "FAILED — ${err:-unknown error}"
+      log_modupdate "FAILED  | $wid | $title | ${err:-download error}"
     fi
   done < <(printf '%s\n' "${rows[@]}")
+  # the timer runs as root: hand everything it touched back to the game user, or
+  # the next pzctl run (as that user) cannot manage those mods
+  fix_owner "$PZ_MODS" "$PZ_INI" "$PZ_UPDATELOG"
   echo "Done: $ok updated, $fail failed. Log: $PZ_UPDATELOG"
 
   if [ "$no_restart" = --no-restart ]; then

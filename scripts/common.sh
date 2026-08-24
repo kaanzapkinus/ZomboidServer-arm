@@ -7,6 +7,10 @@
 #  /etc/zomboid-b42.env, overridable with PZCTL_ENV=<path>), so the same code
 #  drives any number of side-by-side installs (production, test, ...).
 
+# DepotDownloader is a .NET app; without this it needs libicu, which minimal
+# server images don't ship. Exported once here so every call site inherits it.
+export DOTNET_SYSTEM_GLOBALIZATION_INVARIANT=1
+
 # ------------------------------------------------------------ env / paths
 pz_load_env() {
   local envfile="${PZCTL_ENV:-/etc/zomboid-b42.env}"
@@ -30,10 +34,14 @@ pz_load_env() {
   PZ_MANIFEST="$PZ_MODS/.workshop-manifest.tsv"
   PZ_DISABLED="$PZ_MODS/.disabled-mods"
   PZ_UPDATELOG="${PZ_UPDATELOG:-$PZ_CACHEDIR/mod-updates.log}"
+  PZ_DDLOG="${PZ_DDLOG:-$PZ_CACHEDIR/depotdownloader.log}"
   PZ_BACKUPS="${PZ_BACKUPS:-$PZ_HOME/pz_backups}"
   PZ_RCON="${PZ_RCON:-/usr/local/lib/zomboid-arm/pz-rcon.py}"
   PZ_BOOTRETRY="${PZ_BOOTRETRY:-/usr/local/sbin/pz-boot-retry}"
   PZ_BASEMAP="${PZ_BASEMAP:-Muldraugh, KY}"
+  # install_workshop_item usually runs inside $( ), where a plain variable would
+  # not survive the subshell, so failure reasons travel through a file
+  PZ_ERRFILE="${PZ_ERRFILE:-${TMPDIR:-/tmp}/.pzctl-err.$$}"
   # keys that identify THIS host/world; import must never take these from a foreign ini
   PZ_INI_PRESERVE=" DefaultPort UDPPort RCONPort RCONPassword Password PublicName SteamPort1 SteamPort2 WorkshopItems Mods Map ServerPlayerID ResetID Seed SteamVAC server_browser_announced_ip "
   export PZ_SERVICE PZ_CONSOLE PZ_PORT
@@ -56,6 +64,36 @@ fix_owner()    { [ "$(id -u)" -eq 0 ] && chown -R "$PZ_USER":"$PZ_USER" "$@" 2>/
 is_listening() { sudo ss -uln 2>/dev/null | grep -qE ":$PZ_PORT\b"; }
 svc_active()   { [ "$(sudo systemctl is-active "$PZ_SERVICE" 2>/dev/null)" = active ]; }
 
+pz_err()       { PZ_LAST_ERR="$1"; printf '%s\n' "$1" > "${PZ_ERRFILE:-/dev/null}" 2>/dev/null; return 0; }
+pz_err_clear() { PZ_LAST_ERR=""; : > "${PZ_ERRFILE:-/dev/null}" 2>/dev/null; return 0; }
+pz_err_get()   { local e; e="$(cat "${PZ_ERRFILE:-/dev/null}" 2>/dev/null)"; printf '%s' "${e:-${PZ_LAST_ERR:-}}"; }
+
+# Hand a path back to the game user. The mod-update timer runs as root, so
+# anything it copied is root-owned; a later pzctl run as the normal user then
+# cannot delete or overwrite those files. Cheap check first (stops at the first
+# foreign file), recursive chown only when something is actually wrong.
+ensure_owned() {
+  local p="$1"
+  [ -e "$p" ] || return 0
+  [ -z "$(find "$p" -maxdepth 4 ! -user "$PZ_USER" -print -quit 2>/dev/null)" ] && return 0
+  if [ "$(id -u)" -eq 0 ]; then
+    chown -R "$PZ_USER":"$PZ_USER" "$p" 2>/dev/null && return 0
+  fi
+  sudo -n chown -R "$PZ_USER":"$PZ_USER" "$p" 2>/dev/null && return 0
+  return 1
+}
+
+# Is the configured DepotDownloader actually runnable? PZ_DD may be a binary or
+# "dotnet /path/DepotDownloader.dll"; a broken value makes every download fail
+# with no explanation, which is worth catching up front.
+dd_ready() {
+  [ -n "${PZ_DD:-}" ] || return 1
+  case "$PZ_DD" in
+    "dotnet "*) command -v dotnet >/dev/null 2>&1 && [ -f "${PZ_DD#dotnet }" ] ;;
+    *)          [ -x "${PZ_DD%% *}" ] ;;
+  esac
+}
+
 # ------------------------------------------------------------ ini / conf editing
 # awk with values passed through the environment: immune to sed/awk escaping issues
 # no matter what characters a password or server name contains.
@@ -68,7 +106,12 @@ ini_set() {  # ini_set KEY VALUE [FILE]
     index($0, k"=")==1 { print k"="v; done=1; next }
     { print }
     END { if (!done) print k"="v }
-  ' "$f" > "$f.pztmp" && mv "$f.pztmp" "$f"
+  ' "$f" > "$f.pztmp" || { rm -f "$f.pztmp"; return 1; }
+  # keep the original owner/mode: rewriting as root would otherwise hand the
+  # file to root and lock the game user out of its own config
+  chmod --reference="$f" "$f.pztmp" 2>/dev/null || true
+  chown --reference="$f" "$f.pztmp" 2>/dev/null || true
+  mv "$f.pztmp" "$f"
 }
 conf_get() {  # conf_get KEY DEFAULT
   local v; v="$(ini_get "$1" "$PZ_CONF")"
@@ -224,13 +267,22 @@ manifest_row()  { [ -f "$PZ_MANIFEST" ] && grep -m1 "^$1	" "$PZ_MANIFEST" || tru
 # entry across the active and disabled lists).
 install_workshop_item() {
   local wid="$1" ltime="${2:-}" ltitle="${3:-}"
-  local tmp modsdir root info mid; local -a roots=() mids=()
+  local tmp modsdir root info mid dest failed=0; local -a roots=() mids=()
+  dd_ready || { pz_err "DepotDownloader is missing or misconfigured (PZ_DD='${PZ_DD:-}'). Re-run the installer."; return 1; }
   # the temp dir must belong to the game user: DepotDownloader runs as that user
   # even when this code runs as root (systemd timer), and root's mktemp -d would
   # hand it an unwritable 700 directory
   tmp="$(as_user mktemp -d)"
-  [ -d "$tmp" ] || return 1
-  as_user $PZ_DD -app 108600 -pubfile "$wid" -dir "$tmp" >/dev/null 2>&1 || { rm -rf "$tmp"; return 1; }
+  [ -d "$tmp" ] || { pz_err "could not create a temp dir for the download"; return 1; }
+  # keep the downloader's own words: "failed" with no reason is impossible to support
+  mkdir -p "$(dirname "$PZ_DDLOG")" 2>/dev/null
+  printf '\n=== %s  item %s ===\n' "$(date '+%Y-%m-%d %H:%M:%S')" "$wid" >> "$PZ_DDLOG" 2>/dev/null
+  if ! as_user $PZ_DD -app 108600 -pubfile "$wid" -dir "$tmp" >>"$PZ_DDLOG" 2>&1; then
+    pz_err "$(grep -aiE 'error|exception|denied|refused|not found|invalid' "$PZ_DDLOG" 2>/dev/null | tail -2 | tr '\n' ' ')"
+    pz_err "${PZ_LAST_ERR:-download failed; see $PZ_DDLOG}"
+    rm -rf "$tmp"; ddlog_trim; return 1
+  fi
+  ddlog_trim
   # Each mod is an immediate subdirectory of the item's mods/ folder. Ignore nested version
   # subfolders like 42/ (B42 mods carry a mod.info there too -> would look like a separate mod).
   modsdir="$(find "$tmp" -type d -name mods | head -1)"
@@ -244,14 +296,33 @@ install_workshop_item() {
     info="$root/mod.info"; [ -f "$info" ] || info="$(find "$root" -maxdepth 2 -name mod.info | head -1)"
     mid="$(grep -m1 '^id=' "$info" 2>/dev/null | cut -d= -f2- | tr -d '\r')"
     [ -z "$mid" ] && continue
-    rm -rf "${PZ_MODS:?}/$(basename "$root")"
-    cp -r "$root" "$PZ_MODS/"
+    dest="${PZ_MODS:?}/$(basename "$root")"
+    # An existing copy may be root-owned (installed by the root-run update timer)
+    # while we run as the game user. Take ownership back first, and never claim
+    # success when the replace actually failed.
+    if [ -e "$dest" ] && ! ensure_owned "$dest"; then
+      pz_err "'$dest' belongs to another user and could not be reclaimed (needs: sudo chown -R $PZ_USER: '$PZ_MODS')"
+      failed=1; continue
+    fi
+    as_user rm -rf "$dest" 2>/dev/null || rm -rf "$dest" 2>/dev/null
+    if [ -e "$dest" ]; then
+      pz_err "could not remove the old copy at '$dest'"
+      failed=1; continue
+    fi
+    if ! { as_user cp -r "$root" "$PZ_MODS/" 2>/dev/null || cp -r "$root" "$PZ_MODS/" 2>/dev/null; }; then
+      pz_err "could not copy '$mid' into '$PZ_MODS' (permissions or disk space)"
+      failed=1; continue
+    fi
+    fix_owner "$dest"
     mod_disabled "$mid" || mods_append "$mid"
     mids+=("$mid")
     printf '%s\n' "$mid"
   done
   rm -rf "$tmp"
-  [ ${#mids[@]} -eq 0 ] && return 1
+  [ ${#mids[@]} -eq 0 ] && { pz_err "${PZ_LAST_ERR:-no mod.info found in the downloaded item}"; return 1; }
+  # a partial install must not be recorded as up to date, or the broken half
+  # would never be retried
+  [ "$failed" = 1 ] && return 1
   # record in the manifest so pz-modupdate can watch this item for updates
   if [ -z "$ltime" ]; then
     local det
@@ -285,12 +356,18 @@ player_count() {
 
 # ------------------------------------------------------------ backups + update log
 backup_world() {  # backup_world DESTDIR PREFIX  -> echoes archive path
-  local dir="$1" prefix="$2" ts out srv="${PZ_INI%/*}" sav="$PZ_CACHEDIR/Saves"
+  local dir="$1" prefix="$2" ts out srv="${PZ_INI%/*}" sav="$PZ_CACHEDIR/Saves" dbd="$PZ_CACHEDIR/db"
+  local -a paths=()
   ts="$(date +%Y%m%d_%H%M%S)"; mkdir -p "$dir"
   out="$dir/${prefix}_$ts.tar.gz"
-  # tar from / so this works no matter where the cachedir lives; a missing Saves/
-  # (fresh server, no world yet) still archives the Server/ config half.
-  as_user tar czf "$out" -C / "${srv#/}" "${sav#/}" 2>/dev/null
+  # tar from / so this works no matter where the cachedir lives; each part is
+  # only listed when it exists (a fresh server has no Saves/ or db/ yet).
+  # db/ holds the player accounts — a restore without it loses every character.
+  [ -d "$srv" ] && paths+=("${srv#/}")
+  [ -d "$sav" ] && paths+=("${sav#/}")
+  [ -d "$dbd" ] && paths+=("${dbd#/}")
+  [ ${#paths[@]} -eq 0 ] && { echo ""; return 1; }
+  as_user tar czf "$out" -C / "${paths[@]}" 2>/dev/null
   fix_owner "$dir"
   echo "$out"
 }
@@ -299,6 +376,41 @@ rotate_backups() {  # rotate_backups DIR PREFIX KEEP
   while IFS= read -r f; do
     n=$((n+1)); [ "$n" -gt "$3" ] && rm -f "$f"
   done < <(ls -1t "$1/$2"_*.tar.gz 2>/dev/null)
+}
+# every archive we know about, newest first: <path>\t<kind>
+backup_list() {
+  { ls -1t "$PZ_BACKUPS"/pzbackup_*.tar.gz 2>/dev/null | sed 's/$/\tmanual/'
+    ls -1t "$PZ_BACKUPS"/prereset_*.tar.gz 2>/dev/null | sed 's/$/\tpre-reset/'
+    ls -1t "$PZ_BACKUPS"/prerestore_*.tar.gz 2>/dev/null | sed 's/$/\tpre-restore/'
+    ls -1t "$PZ_BACKUPS"/mod-update/modup_*.tar.gz 2>/dev/null | sed 's/$/\tmod-update/'
+  } 2>/dev/null | grep . || true
+}
+# Restore an archive over the live data dir. Handles both layouts we have shipped:
+# paths rooted at / (current) and paths relative to the home dir (first release).
+backup_restore() {  # backup_restore ARCHIVE  -> 0 on success
+  local f="$1" first rel_root rel_home
+  [ -f "$f" ] || return 1
+  first="$(as_user tar tzf "$f" 2>/dev/null | head -1)"
+  [ -n "$first" ] || return 1
+  first="${first#./}"; first="${first#/}"
+  # Compare against this install's own paths instead of guessing from the first
+  # path component: the data dir does not have to live under /home.
+  rel_root="${PZ_CACHEDIR#/}"            # e.g. home/ubuntu/Zomboid
+  rel_home="${PZ_CACHEDIR#"$PZ_HOME"/}"  # e.g. Zomboid  (first release layout)
+  case "$first" in
+    "$rel_root"/*) as_user tar xzf "$f" -C / 2>/dev/null || return 1 ;;
+    "$rel_home"/*) as_user tar xzf "$f" -C "$PZ_HOME" 2>/dev/null || return 1 ;;
+    *) return 1 ;;                       # archive from a different install
+  esac
+  fix_owner "$PZ_CACHEDIR"
+  return 0
+}
+ddlog_trim() {  # keep the downloader log from growing forever
+  [ -f "$PZ_DDLOG" ] || return 0
+  if [ "$(wc -l < "$PZ_DDLOG" 2>/dev/null || echo 0)" -gt 2000 ]; then
+    tail -n 1000 "$PZ_DDLOG" > "$PZ_DDLOG.pztmp" 2>/dev/null && mv "$PZ_DDLOG.pztmp" "$PZ_DDLOG"
+  fi
+  fix_owner "$PZ_DDLOG"
 }
 log_modupdate() {  # log_modupdate "message"  (capped at 1000 entries)
   printf '%s | %s\n' "$(date '+%Y-%m-%d %H:%M')" "$1" >> "$PZ_UPDATELOG"

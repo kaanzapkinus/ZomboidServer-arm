@@ -70,6 +70,11 @@ WS="$INSTALL_DIR/steamapps/workshop/content/108600"
 say "Service: $(b "$SVC")   user: $(b "$TARGET_USER")   data: $(b "$CACHEDIR")"
 
 [[ "$PORT" =~ ^[0-9]+$ ]] || die "PZ_PORT must be a number."
+# systemd Environment= lines and the server's own -cachedir argument cannot carry
+# spaces, so reject them here instead of failing in confusing ways later
+case "$INSTALL_DIR$CACHEDIR$BACKUPS" in
+  *' '*) die "Install/data/backup paths must not contain spaces." ;;
+esac
 
 # ----------------------------------------------------------------- refresh package lists FIRST
 # People forget `sudo apt update` on a fresh box, which then breaks every package install.
@@ -151,9 +156,8 @@ say "Branch: $(b "$BRANCH")"
 step "Installing dependencies"
 # No system Java needed (the server bundles its own x86 jre64, run via box64).
 # No box86 / armhf libs needed (we use DepotDownloader, not 32-bit steamcmd).
-# tcpdump powers pz-boot-retry's Steam-session health gate (relay players need a live session)
-apt-get install -y -qq ciopfs fuse3 wget curl unzip jq gnupg ca-certificates python3 tcpdump >/dev/null || \
-  apt-get install -y -qq ciopfs fuse wget curl unzip jq gnupg ca-certificates python3 tcpdump >/dev/null
+apt-get install -y -qq ciopfs fuse3 wget curl unzip jq gnupg ca-certificates python3 >/dev/null || \
+  apt-get install -y -qq ciopfs fuse wget curl unzip jq gnupg ca-certificates python3 >/dev/null
 # allow_other for the ciopfs FUSE mount
 grep -q '^user_allow_other' /etc/fuse.conf 2>/dev/null || echo 'user_allow_other' >> /etc/fuse.conf
 
@@ -211,6 +215,12 @@ else
     curl -fsSL "$URL" -o /tmp/dd.zip && unzip -oq /tmp/dd.zip -d "$DD_DIR"; DD="dotnet $DD_DIR/DepotDownloader.dll"
   fi
 fi
+# Verify it before we depend on it: a half-installed downloader otherwise shows
+# up much later as "every mod download failed" with no explanation.
+case "$DD" in
+  "dotnet "*) command -v dotnet >/dev/null && [ -f "${DD#dotnet }" ] ;;
+  *)          [ -x "$DD" ] ;;
+esac || die "DepotDownloader did not install correctly ($DD). Check the network/GitHub access and re-run."
 say "DepotDownloader: $DD"
 
 # ----------------------------------------------------------------- 3. download the server
@@ -272,30 +282,39 @@ install -m755 "$REPO_DIR/scripts/pz-rcon.py" "$LIBDIR/pz-rcon.py"
 if [ -n "$SFX" ]; then
   sed -i "s|/etc/zomboid-b42.env|$ENVFILE|g" "$BIN_PZCTL" "$BIN_MODUPDATE"
 fi
-# let pzctl & friends know the environment on this host
+# let pzctl & friends know the environment on this host.
+# Every value is single-quoted: the file is SOURCED, so a bare multi-word value
+# (e.g. PZ_DD=dotnet /path/DepotDownloader.dll) would try to run its second word
+# as a command and leave the variable unset -> every mod download fails later.
+q() { printf "'%s'" "$(printf '%s' "$1" | sed "s/'/'\\\\''/g")"; }
 cat > "$ENVFILE" <<EOF
-PZ_SERVICE=$SVC
-PZ_USER=$TARGET_USER
-PZ_INSTALL=$INSTALL_DIR
-PZ_CACHEDIR=$CACHEDIR
-PZ_CONSOLE=$CACHEDIR/server-console.txt
-PZ_INI=$CACHEDIR/Server/$SERVERNAME.ini
-PZ_MODS=$CACHEDIR/mods
-PZ_DD=$DD
-PZ_PORT=$PORT
-PZ_RCONPORT=$RCONPORT
-PZ_BRANCH=$BRANCH
-PZ_SERVERNAME=$SERVERNAME
-PZ_COMMON=$LIBDIR/common.sh
-PZ_RCON=$LIBDIR/pz-rcon.py
-PZ_BOOTRETRY=$BIN_BOOTRETRY
-PZ_WATCHDOG=$BIN_WATCHDOG
-PZ_MODUPDATE=$BIN_MODUPDATE
-PZ_PZCTL=$BIN_PZCTL
-PZ_CONF=$CACHEDIR/pzctl.conf
-PZ_UPDATELOG=$CACHEDIR/mod-updates.log
-PZ_BACKUPS=$BACKUPS
+PZ_SERVICE=$(q "$SVC")
+PZ_USER=$(q "$TARGET_USER")
+PZ_INSTALL=$(q "$INSTALL_DIR")
+PZ_CACHEDIR=$(q "$CACHEDIR")
+PZ_CONSOLE=$(q "$CACHEDIR/server-console.txt")
+PZ_INI=$(q "$CACHEDIR/Server/$SERVERNAME.ini")
+PZ_MODS=$(q "$CACHEDIR/mods")
+PZ_DD=$(q "$DD")
+PZ_PORT=$(q "$PORT")
+PZ_RCONPORT=$(q "$RCONPORT")
+PZ_BRANCH=$(q "$BRANCH")
+PZ_SERVERNAME=$(q "$SERVERNAME")
+PZ_COMMON=$(q "$LIBDIR/common.sh")
+PZ_RCON=$(q "$LIBDIR/pz-rcon.py")
+PZ_BOOTRETRY=$(q "$BIN_BOOTRETRY")
+PZ_WATCHDOG=$(q "$BIN_WATCHDOG")
+PZ_MODUPDATE=$(q "$BIN_MODUPDATE")
+PZ_PZCTL=$(q "$BIN_PZCTL")
+PZ_CONF=$(q "$CACHEDIR/pzctl.conf")
+PZ_UPDATELOG=$(q "$CACHEDIR/mod-updates.log")
+PZ_DDLOG=$(q "$CACHEDIR/depotdownloader.log")
+PZ_BACKUPS=$(q "$BACKUPS")
 EOF
+# a sourced env file that errors out is a silent disaster; prove it loads clean
+if ! ( set -e; . "$ENVFILE" ) >/dev/null 2>&1; then
+  die "The generated $ENVFILE does not parse. Please report this with your paths."
+fi
 systemctl daemon-reload
 systemctl enable "$SVC-ciopfs.service" "$SVC.service" "$SVC-watchdog.timer" "$SVC-modupdate.timer" >/dev/null 2>&1
 systemctl start  "$SVC-ciopfs.service"
